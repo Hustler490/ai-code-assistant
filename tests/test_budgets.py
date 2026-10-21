@@ -5,7 +5,15 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.extensions import db
-from app.models import AuditLog, Budget, Conversation, Notification, UsageRecord, Workspace
+from app.models import (
+    AuditLog,
+    Budget,
+    Conversation,
+    Notification,
+    NotificationPreference,
+    UsageRecord,
+    Workspace,
+)
 from app.services import audit, budgets
 
 
@@ -437,6 +445,19 @@ class TestNotifications:
         usage_ledger.record_usage(source="chat", user=user, total_tokens=6)
 
         assert Notification.query.filter_by(type="budget_alert").count() == 1
+
+    def test_budget_alert_preference_suppresses_delivery(self, app, make_user):
+        user = make_user()
+        db.session.add(NotificationPreference(user_id=user.id, budget_alerts=False))
+        db.session.commit()
+        _token_budget(user, 10, threshold=0.5)
+        _usage(user, tokens=5)
+
+        decision = budgets.check_budgets(user)
+        assert decision.warned
+        assert budgets.notify_decision(user, decision, level="warning") == []
+        db.session.commit()
+        assert Notification.query.filter_by(type="budget_alert").count() == 0
 
     def test_block_notification_mentions_limits(self, app, make_user):
         user = make_user()
