@@ -611,6 +611,7 @@ trusted, and plugin outbound traffic is denied until an operator opts in.
 | `PLUGIN_MARKETPLACE_ENABLED` | `1` | Enables the read-only discovery API (`GET /plugins/api/marketplace`). Disabling returns 404. |
 | `PLUGIN_MARKETPLACE_CATALOG` | `plugins/marketplace.json` | Local JSON catalog for the discovery API. Ships empty; set it to advertise validated entries. |
 | `PLUGIN_MARKETPLACE_URL` | empty | Optional https catalog URL fetched through the bounded plugin transport when no local marketplace catalog is configured. The host must be on `PLUGIN_NETWORK_ALLOWLIST`; redirects, non-https URLs, oversized bodies, and non-allowlisted hosts are refused before any request. |
+| `PLUGIN_MARKETPLACE_CACHE_TTL` | `60` | Seconds a parsed discovery catalog stays cached in-process, keyed by source. `0` disables caching. Clear it with `flask plugins clear-marketplace-cache`. |
 | `PLUGIN_DISCOVERY_DIR` | `plugins` | Read-only directory scanned for `manifest.json` files by `GET /plugins/discover`. Nothing is installed or executed. |
 | `PLUGIN_TRUST_POLICY` | `if-present` | `if-present` accepts unsigned manifests but always refuses forged or untrusted signatures; `required` also refuses unsigned manifests. Use `required` for a hosted marketplace. |
 | `PLUGIN_TRUSTED_KEYS` | `{}` | JSON object of canonical publisher ids to Ed25519 public keys (base64 raw 32 bytes or PEM). Invalid key material aborts startup. |
@@ -626,10 +627,18 @@ trusted, and plugin outbound traffic is denied until an operator opts in.
 | `PLUGIN_CONFIG_MAX_DEPTH` | `8` | Maximum nesting depth of a stored plugin configuration. |
 | `PLUGIN_ERROR_REPORT_LIMIT` | `100` | Maximum error reports returned to a workspace owner (hard ceiling `500`). |
 
-**Catalog cache:** there is no active cache TTL setting yet. The catalog file is
-validated and re-read for each install request, so an operator's catalog edit is
-visible immediately. A TTL cache and its `PLUGIN_MARKETPLACE_CACHE_TTL` setting
-are tracked separately in #377.
+**Catalog cache (#377):** the read-only discovery catalog is parsed once per
+source and cached in-process for `PLUGIN_MARKETPLACE_CACHE_TTL` seconds. A cache
+hit skips the file read/fetch and re-validation; entries expire after the TTL,
+and `0` disables the cache. The source is part of the key, so switching
+`PLUGIN_MARKETPLACE_CATALOG`/`PLUGIN_MARKETPLACE_URL` never serves another
+source's entries. Clear it immediately with
+`flask plugins clear-marketplace-cache`; tests can call
+`app.services.marketplace.clear_marketplace_cache()`.
+
+The installer catalog (`PLUGIN_CATALOG_FILE`/`PLUGIN_MARKETPLACE_URL` read by
+`load_plugin_catalog`) is still re-read for each install request, so install
+trust decisions never use a stale discovery cache.
 
 **Remote catalog (#375):** when `PLUGIN_CATALOG_FILE` is empty and
 `PLUGIN_MARKETPLACE_URL` is set, the catalog is fetched through

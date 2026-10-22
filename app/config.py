@@ -177,6 +177,10 @@ class Config:
     # transport: https only, host allowlisted, timeout, size cap, no redirects.
     # Empty by default, so remote fetching stays opt-in and fail closed.
     PLUGIN_MARKETPLACE_URL = os.getenv("PLUGIN_MARKETPLACE_URL", "")
+    # Parsed marketplace catalogs are cached in-process for this many seconds
+    # (#377). Set to 0 to disable; ``flask plugins clear-marketplace-cache`` is
+    # the explicit operator/test cache-bust.
+    PLUGIN_MARKETPLACE_CACHE_TTL = int(os.getenv("PLUGIN_MARKETPLACE_CACHE_TTL", "60"))
 
     # Directory scanned by the read-only plugin discovery endpoint (#172).
     # Discovery only reads ``manifest.json`` files from plugin subdirectories

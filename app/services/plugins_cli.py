@@ -12,6 +12,7 @@ Usage (inside the Flask app context):
     flask plugins lockfile <workspace-id> [--json]
     flask plugins publishers [--json]
     flask plugins errors [--json]
+    flask plugins clear-marketplace-cache [--json]
 
 The CLI acts as the **operator**, not as an end user: it reads/writes the
 persisted ``Plugin`` rows and never performs per-user workspace authorization.
@@ -402,6 +403,19 @@ def register_plugins_cli(app: Flask) -> None:
                     f"{plugin['source']} {plugin['integrity']}"
                 )
                 click.echo(line)
+        return EXIT_OK
+
+    @plugins_group.command("clear-marketplace-cache")
+    @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+    def clear_marketplace_cache_command(as_json: bool) -> int:
+        """Drop the in-process marketplace catalog cache (#377)."""
+        from app.services.marketplace import clear_marketplace_cache
+
+        cleared = clear_marketplace_cache()
+        if as_json:
+            _write_json({"cleared": cleared})
+        else:
+            click.echo(f"Cleared {cleared} marketplace catalog cache entries.")
         return EXIT_OK
 
 
