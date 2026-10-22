@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
@@ -229,6 +230,52 @@ def _catalog_source(config: Mapping[str, Any]) -> tuple[str, str]:
     return "file", str(DEFAULT_CATALOG_PATH)
 
 
+#: Default lifetime of a parsed marketplace catalog, in seconds. ``0`` disables
+#: the TTL cache and restores a re-read per request.
+DEFAULT_CACHE_TTL_SECONDS = 60
+
+_TTL_CACHE_LOCK = threading.Lock()
+#: ``cache key -> (expires_at_monotonic, catalog)``.
+_TTL_CACHE: dict[str, tuple[float, MarketplaceCatalog]] = {}
+
+
+def _cache_ttl(config: Mapping[str, Any]) -> int:
+    """Return the configured TTL, clamped to ``>= 0``."""
+    raw = config.get("PLUGIN_MARKETPLACE_CACHE_TTL", DEFAULT_CACHE_TTL_SECONDS)
+    try:
+        ttl = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CACHE_TTL_SECONDS
+    return max(0, ttl)
+
+
+def clear_marketplace_cache() -> int:
+    """Drop every parsed catalog and return the number of entries removed."""
+    with _TTL_CACHE_LOCK:
+        cleared = len(_TTL_CACHE)
+        _TTL_CACHE.clear()
+    with _CATALOG_CACHE_LOCK:
+        _LAST_GOOD_CATALOGS.clear()
+    return cleared
+
+
+def _cache_get(key: str, now: float) -> MarketplaceCatalog | None:
+    with _TTL_CACHE_LOCK:
+        entry = _TTL_CACHE.get(key)
+        if entry is None:
+            return None
+        expires_at, catalog = entry
+        if now >= expires_at:
+            _TTL_CACHE.pop(key, None)
+            return None
+        return catalog
+
+
+def _cache_put(key: str, catalog: MarketplaceCatalog, ttl: int, now: float) -> None:
+    with _TTL_CACHE_LOCK:
+        _TTL_CACHE[key] = (now + ttl, catalog)
+
+
 #: Process-local last-known-good catalogs, keyed by ``(source kind, source)``.
 #: An offline source falls back to its last good catalog instead of disappearing
 #: (#380). The cache is deliberately small and never persisted.
@@ -240,6 +287,8 @@ def reset_marketplace_cache() -> None:
     """Forget cached catalogs (tests and explicit configuration changes)."""
     with _CATALOG_CACHE_LOCK:
         _LAST_GOOD_CATALOGS.clear()
+    with _TTL_CACHE_LOCK:
+        _TTL_CACHE.clear()
 
 
 def _remember_catalog(kind: str, value: str, catalog: MarketplaceCatalog) -> None:
@@ -257,8 +306,14 @@ def load_marketplace(
     *,
     resolver: Any = None,
     transport: Any = None,
+    now: float | None = None,
+    cache_bust: bool = False,
 ) -> MarketplaceCatalog:
     """Load and validate the configured marketplace catalog.
+
+    Parsed catalogs are cached in-process for ``PLUGIN_MARKETPLACE_CACHE_TTL``
+    seconds, keyed by source. ``cache_bust`` forces a re-read and refreshes the
+    cache; a custom resolver/transport bypasses the cache for tests.
 
     Raises:
         MarketplaceDisabledError: When ``PLUGIN_MARKETPLACE_ENABLED`` is false.
@@ -269,6 +324,15 @@ def load_marketplace(
         raise MarketplaceDisabledError("The plugin marketplace is disabled.")
 
     kind, value = _catalog_source(config)
+    ttl = _cache_ttl(config)
+    use_cache = ttl > 0 and resolver is None and transport is None
+    key = f"{kind}:{value}"
+    moment = time.monotonic() if now is None else now
+    if use_cache and not cache_bust:
+        cached = _cache_get(key, moment)
+        if cached is not None:
+            return cached
+
     try:
         if kind == "remote":
             catalog = load_remote_catalog(config, resolver=resolver, transport=transport)
@@ -282,6 +346,8 @@ def load_marketplace(
     entries = [_flatten(entry, index) for index, entry in enumerate(catalog.list_entries())]
     result = MarketplaceCatalog(entries)
     _remember_catalog(kind, value, result)
+    if use_cache:
+        _cache_put(key, result, ttl, moment)
     return result
 
 
@@ -363,22 +429,33 @@ def load_marketplace_catalog(
     *,
     resolver: Any = None,
     transport: Any = None,
+    now: float | None = None,
+    cache_bust: bool = False,
 ) -> MarketplaceLoadResult:
-    """Load a catalog leniently for discovery (#374/#376).
+    """Load a catalog leniently for discovery (#374/#376/#377).
 
     Missing or unreadable local files yield an **empty catalog without error**.
     Invalid individual entries are skipped and reported as bounded warnings;
     a malformed JSON document, wrong version, or non-list ``plugins`` still
     raise :class:`MarketplaceError` so operators can fix it.
 
-    Remote catalogs use the same bounded transport as the strict loader.
+    A successful catalog is cached for ``PLUGIN_MARKETPLACE_CACHE_TTL`` seconds;
+    stale/unavailable fallbacks are not cached.
     """
     if not config.get("PLUGIN_MARKETPLACE_ENABLED", True):
         raise MarketplaceDisabledError("The plugin marketplace is disabled.")
 
-    warnings: list[str] = []
     kind, value = _catalog_source(config)
+    ttl = _cache_ttl(config)
+    use_cache = ttl > 0 and resolver is None and transport is None
+    key = f"{kind}:{value}"
+    moment = time.monotonic() if now is None else now
+    if use_cache and not cache_bust:
+        cached = _cache_get(key, moment)
+        if cached is not None:
+            return MarketplaceLoadResult(cached)
 
+    warnings: list[str] = []
     if kind == "remote":
         try:
             catalog = load_remote_catalog(config, resolver=resolver, transport=transport)
@@ -389,6 +466,8 @@ def load_marketplace_catalog(
         entries = [_flatten(entry, index) for index, entry in enumerate(catalog.list_entries())]
         result = MarketplaceCatalog(entries)
         _remember_catalog(kind, value, result)
+        if use_cache:
+            _cache_put(key, result, ttl, moment)
         return MarketplaceLoadResult(result, tuple(warnings))
 
     document = _read_local_document(value)
@@ -409,6 +488,8 @@ def load_marketplace_catalog(
             _add_warning(warnings, f"plugins[{index}]: {exc}")
     result = MarketplaceCatalog(entries)
     _remember_catalog(kind, value, result)
+    if use_cache:
+        _cache_put(key, result, ttl, moment)
     return MarketplaceLoadResult(result, tuple(warnings))
 
 
@@ -439,6 +520,7 @@ def filter_entries(
 
 
 __all__ = [
+    "DEFAULT_CACHE_TTL_SECONDS",
     "DEFAULT_CATALOG_PATH",
     "MANIFEST_SCHEMA_PATH",
     "MAX_MARKETPLACE_WARNINGS",
@@ -449,6 +531,7 @@ __all__ = [
     "MarketplaceError",
     "MarketplaceLoadResult",
     "MarketplaceUnavailableError",
+    "clear_marketplace_cache",
     "filter_entries",
     "load_marketplace",
     "load_marketplace_catalog",
